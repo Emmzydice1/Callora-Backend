@@ -126,6 +126,18 @@ export interface BillingServiceOptions {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Convert a human-readable USDC amount into 7-decimal Soroban contract units.
+ *
+ * USDC on Stellar uses 7 decimal places, so `1` USDC becomes `10_000_000n`.
+ * The input is trimmed and must be a positive decimal with at most 7 fractional
+ * digits; extra digits are neither rounded nor silently accepted.
+ *
+ * @param amountUsdc - Decimal USDC amount, e.g. `"0.01"`.
+ * @returns The amount scaled by `10^7` as a `bigint`.
+ * @throws {Error} When the value is not a positive decimal with at most 7
+ * fractional digits, or when it scales to zero.
+ */
 export function parseUsdcToContractUnits(amountUsdc: string): bigint {
   const trimmed = amountUsdc.trim();
   if (!/^\d+(\.\d{1,7})?$/.test(trimmed)) {
@@ -213,10 +225,32 @@ function classifyTransientError(error: unknown): boolean {
   return transientPatterns.some((pattern) => pattern.test(message));
 }
 
+/**
+ * Classify a Soroban/network error as transient (safe to retry) or not.
+ *
+ * Classification is by error type and category rather than substring matching,
+ * so messages that merely contain numbers such as `503` or `429` are not
+ * misread as retryable. Transient errors are `SorobanRpcError`s with a
+ * `TIMEOUT`/`NETWORK_ERROR` category, Node system errors carrying a known
+ * transient errno, and — as a last-resort fallback — plain errors whose message
+ * matches word-boundary network/rate-limit patterns.
+ *
+ * @param error - Any thrown value.
+ * @returns `true` when the error looks retryable, otherwise `false`.
+ */
 export function isTransientSorobanError(error: unknown): boolean {
   return classifyTransientError(error);
 }
 
+/**
+ * Format 7-decimal Soroban contract units back into a USDC string.
+ *
+ * The inverse of {@link parseUsdcToContractUnits}: trailing zeros are trimmed
+ * and the decimal point is dropped for whole-number amounts.
+ *
+ * @param amount - Contract units (`bigint`, scaled by `10^7`).
+ * @returns A decimal USDC string such as `"0.01"` or `"3"`.
+ */
 export function formatContractUnitsToUsdc(amount: bigint): string {
   const whole = amount / USDC_7_DECIMAL_FACTOR;
   const fraction = amount % USDC_7_DECIMAL_FACTOR;
@@ -469,10 +503,26 @@ async function runPhase1Bulk(
 // BillingService
 // ---------------------------------------------------------------------------
 
+/**
+ * Records usage events and deducts prepaid USDC from a developer's Soroban
+ * balance.
+ *
+ * Deduction is idempotent on `requestId`: the first call inserts a usage event
+ * and performs the Soroban transfer, while later calls with the same id return
+ * the persisted row without a second transfer. Concurrent deductions for the
+ * same user are serialised (see {@link billingConcurrencySemaphore}) so the
+ * balance pre-check and the transfer cannot interleave into an overdraft.
+ */
 export class BillingService {
   private readonly retryDelaysMs: number[];
   private readonly random: RandomSource;
 
+  /**
+   * @param pool - Postgres pool used to persist usage events.
+   * @param sorobanClient - Client that reads balances and submits transfers.
+   * @param options - Retry schedule and jitter source; see
+   * {@link BillingServiceOptions}.
+   */
   constructor(
     private readonly pool: Pool,
     private readonly sorobanClient: SorobanClient,
@@ -482,6 +532,20 @@ export class BillingService {
     this.random = options.random ?? Math.random;
   }
 
+  /**
+   * Deduct `request.amountUsdc` from `request.userId` and record a usage event.
+   *
+   * Runs under the per-user concurrency slot. If the `requestId` was already
+   * processed, the persisted result is returned with `alreadyProcessed: true`
+   * and no new Soroban call is made. A pre-flight balance check fails fast
+   * before any row is written.
+   *
+   * @param request - Deduction details; `requestId` is the idempotency key.
+   * @returns The outcome. Read the flags together: `success` is `true` only when
+   * the transfer completed and `stellarTxHash` is persisted; on failure `error`
+   * (and possibly `simulationDetails`) explains why, and
+   * `reconciliationRequired` marks a pending row that still needs reconciling.
+   */
   async deduct(request: BillingDeductRequest): Promise<BillingDeductResult> {
     // Serialise deductions per user so the Soroban balance pre-check and the
     // deduction cannot interleave across concurrent requests for the same user.
@@ -490,6 +554,21 @@ export class BillingService {
     );
   }
 
+  /**
+   * Deduct several usage entries for a single user in one batch.
+   *
+   * Every entry must target the same `userId`. The batch is idempotent on the
+   * set of `requestId`s (or the caller-supplied `idempotencyKey`) and submits a
+   * single Soroban transfer for the summed amount.
+   *
+   * @param requests - Non-empty list of deductions, all for one user.
+   * @param idempotencyKey - Optional key; derived from the sorted request ids
+   * when omitted.
+   * @returns Aggregate flags (`success`, `deductedCount`,
+   * `totalDeductedAmountUsdc`) plus a per-entry `results` array whose items
+   * carry the same `alreadyProcessed` / `deductionApplied` /
+   * `reconciliationRequired` semantics as {@link BillingService.deduct}.
+   */
   async deductBulk(
     requests: BillingDeductRequest[],
     idempotencyKey?: string,
@@ -919,6 +998,15 @@ export class BillingService {
     };
   }
 
+  /**
+   * Look up a previously recorded usage event by its request id.
+   *
+   * @param requestId - The idempotency key used when the deduction was made.
+   * @returns The persisted result, or `null` when no event exists. `success`
+   * reflects whether a Stellar transaction hash is present, so a pending row is
+   * reported with `success: false` and `reconciliationRequired: true` rather
+   * than as a success.
+   */
   async getByRequestId(requestId: string): Promise<BillingDeductResult | null> {
     const result = await this.pool.query<{
       id: string;
